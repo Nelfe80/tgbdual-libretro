@@ -96,6 +96,87 @@ static void cleanup_emulators(void)
    }
 }
 
+/* Memory map exposed through RETRO_ENVIRONMENT_SET_MEMORY_MAPS.
+ *
+ * Game Boy #1 is mapped at its native addresses, using the same layout as
+ * the rcheevos Game Boy / Game Boy Color memory map:
+ *   0x8000-0x9FFF  VRAM (bank 0)
+ *   0xA000-0xBFFF  cartridge RAM (bank 0)
+ *   0xC000-0xCFFF  WRAM bank 0
+ *   0xD000-0xDFFF  WRAM bank 1
+ *   0xFF80-0xFFFE  HRAM (0xFFFF reads a spare byte, not the IE register)
+ *   0x10000-0x15FFF WRAM banks 2-7 (Game Boy Color only)
+ *   0x16000-...     cartridge RAM banks 1-15 (when present)
+ * Game Boy #2 (link cable emulation) uses the same layout, offset by
+ * 0x10000000: e.g. its WRAM bank 0 is at 0x1000C000.
+ * Only the address map is new: emulation and save states are unchanged. */
+#define GB_MEMMAP_CONSOLE_STRIDE 0x10000000
+#define GB_MEMMAP_MAX_PER_CONSOLE 24
+static struct retro_memory_descriptor memmap_descs[2 * GB_MEMMAP_MAX_PER_CONSOLE];
+
+static void memmap_add(unsigned *count, uint64_t flags, void *ptr,
+      size_t offset, size_t start, size_t len)
+{
+   struct retro_memory_descriptor *desc = &memmap_descs[(*count)++];
+   memset(desc, 0, sizeof(*desc));
+   desc->flags  = flags;
+   desc->ptr    = ptr;
+   desc->offset = offset;
+   desc->start  = start;
+   desc->len    = len;
+}
+
+static void set_memory_maps(void)
+{
+   struct retro_memory_map mmaps;
+   unsigned count = 0;
+   unsigned i;
+
+   for (i = 0; i < 2; i++)
+   {
+      size_t base;
+      byte *ram, *sram;
+      int sram_size, bank;
+
+      if (!g_gb[i])
+         continue;
+
+      base      = (size_t)i * GB_MEMMAP_CONSOLE_STRIDE;
+      ram       = g_gb[i]->get_cpu()->get_ram();
+      sram      = g_gb[i]->get_rom()->get_sram();
+      sram_size = g_gb[i]->get_rom()->get_sram_size();
+
+      memmap_add(&count, RETRO_MEMDESC_VIDEO_RAM,
+            g_gb[i]->get_cpu()->get_vram(), 0, base + 0x8000, 0x2000);
+      if (sram && sram_size >= 0x2000)
+         memmap_add(&count, RETRO_MEMDESC_SAVE_RAM, sram, 0,
+               base + 0xA000, 0x2000);
+      memmap_add(&count, RETRO_MEMDESC_SYSTEM_RAM, ram, 0x0000,
+            base + 0xC000, 0x1000);
+      memmap_add(&count, RETRO_MEMDESC_SYSTEM_RAM, ram, 0x1000,
+            base + 0xD000, 0x1000);
+      memmap_add(&count, RETRO_MEMDESC_SYSTEM_RAM,
+            g_gb[i]->get_cpu()->get_stack(), 0, base + 0xFF80, 0x80);
+
+      if (g_gb[i]->get_rom()->get_info()->gb_type >= 3)
+      {
+         /* power-of-two sized descriptors only */
+         memmap_add(&count, RETRO_MEMDESC_SYSTEM_RAM, ram, 0x2000,
+               base + 0x10000, 0x4000);
+         memmap_add(&count, RETRO_MEMDESC_SYSTEM_RAM, ram, 0x6000,
+               base + 0x14000, 0x2000);
+      }
+
+      for (bank = 1; sram && bank < 16 && (bank + 1) * 0x2000 <= sram_size; bank++)
+         memmap_add(&count, RETRO_MEMDESC_SAVE_RAM, sram, bank * 0x2000,
+               base + 0x16000 + (bank - 1) * 0x2000, 0x2000);
+   }
+
+   mmaps.descriptors     = memmap_descs;
+   mmaps.num_descriptors = count;
+   environ_cb(RETRO_ENVIRONMENT_SET_MEMORY_MAPS, &mmaps);
+}
+
 void retro_get_system_info(struct retro_system_info *info)
 {
    info->library_name     = "TGB Dual";
@@ -351,6 +432,7 @@ bool retro_load_game(const struct retro_game_info *info)
       mode = MODE_SINGLE_GAME;
 
    check_variables();
+   set_memory_maps();
 
    return true;
 }
@@ -443,6 +525,7 @@ bool retro_load_game_special(unsigned type, const struct retro_game_info *info, 
       // g_gb[1] for RETRO_MEMORY_GAMEBOY_2_*.
       mode = MODE_SINGLE_GAME;
    }
+   set_memory_maps();
    return true;
 }
 
